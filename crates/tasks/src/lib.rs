@@ -350,6 +350,7 @@ impl TaskExecutor {
         }
         .in_current_span();
 
+        self.metrics.inc_regular_tasks();
         self.spawn_on_rt(task, task_kind)
     }
 
@@ -386,9 +387,7 @@ impl TaskExecutor {
         let on_shutdown = self.on_shutdown.clone();
         let fut = f(on_shutdown);
 
-        let task = fut.in_current_span();
-
-        self.handle.spawn(task)
+        self.spawn(fut)
     }
 
     /// Spawns a critical task depending on the given [`TaskKind`]
@@ -412,6 +411,7 @@ impl TaskExecutor {
                 error!("{task_error}");
                 let _ = panicked_tasks_tx.send(task_error);
             })
+            .map(drop)
             .in_current_span();
 
         // Clone only the specific counter that we need.
@@ -424,6 +424,7 @@ impl TaskExecutor {
             let _ = select(on_shutdown, task).await;
         };
 
+        self.metrics.inc_critical_tasks();
         self.spawn_on_rt(task, task_kind)
     }
 
@@ -460,22 +461,9 @@ impl TaskExecutor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let panicked_tasks_tx = self.panicked_tasks_tx.clone();
         let on_shutdown = self.on_shutdown.clone();
         let fut = f(on_shutdown);
-
-        // wrap the task in catch unwind
-        let task = std::panic::AssertUnwindSafe(fut)
-            .catch_unwind()
-            .map_err(move |error| {
-                let task_error = PanickedTaskError::new(name, error);
-                error!("{task_error}");
-                let _ = panicked_tasks_tx.send(task_error);
-            })
-            .map(drop)
-            .in_current_span();
-
-        self.handle.spawn(task)
+        self.spawn_critical(name, fut)
     }
 
     /// This spawns a critical task onto the runtime.
@@ -506,25 +494,12 @@ impl TaskExecutor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let panicked_tasks_tx = self.panicked_tasks_tx.clone();
         let on_shutdown = GracefulShutdown::new(
             self.on_shutdown.clone(),
             GracefulShutdownGuard::new(Arc::clone(&self.graceful_tasks)),
         );
         let fut = f(on_shutdown);
-
-        // wrap the task in catch unwind
-        let task = std::panic::AssertUnwindSafe(fut)
-            .catch_unwind()
-            .map_err(move |error| {
-                let task_error = PanickedTaskError::new(name, error);
-                error!("{task_error}");
-                let _ = panicked_tasks_tx.send(task_error);
-            })
-            .map(drop)
-            .in_current_span();
-
-        self.handle.spawn(task)
+        self.spawn_critical(name, fut)
     }
 
     /// This spawns a regular task onto the runtime.
@@ -559,18 +534,16 @@ impl TaskExecutor {
         );
         let fut = f(on_shutdown);
 
-        self.handle.spawn(fut)
+        self.spawn(fut)
     }
 }
 
 impl TaskSpawner for TaskExecutor {
     fn spawn(&self, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        self.metrics.inc_regular_tasks();
         self.spawn(fut)
     }
 
     fn spawn_critical(&self, name: &'static str, fut: BoxFuture<'static, ()>) -> JoinHandle<()> {
-        self.metrics.inc_critical_tasks();
         Self::spawn_critical(self, name, fut)
     }
 
